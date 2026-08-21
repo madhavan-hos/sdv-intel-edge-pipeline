@@ -1,0 +1,16 @@
+# Virtual Environments
+ai_env/
+venv/
+ENV/
+env/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Local runtime & test outputs
+runs/
+*.log
+.cache/
