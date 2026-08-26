@@ -17,7 +17,7 @@ import pyrealsense2 as rs
 from ultralytics import YOLO
 
 
-PIPELINE_VERSION = "2026.08.26-detection-v5"
+PIPELINE_VERSION = "2026.08.26-lane-v6"
 
 
 state = {
@@ -258,6 +258,125 @@ def realsense_inference_thread(model_path, confidence, iou):
                 counter_start = now
 
 
+def fit_lane_boundary(segments, y_top, y_bottom, frame_width):
+    """Fit one stable boundary through all accepted Hough segments."""
+    if not segments:
+        return None
+
+    points = np.array(
+        [(x1, y1) for x1, y1, _, _ in segments]
+        + [(x2, y2) for _, _, x2, y2 in segments],
+        dtype=np.float32,
+    )
+    vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    if abs(vy) < 1e-6:
+        return None
+
+    x_top = int(x0 + (y_top - y0) * vx / vy)
+    x_bottom = int(x0 + (y_bottom - y0) * vx / vy)
+    x_top = min(max(x_top, 0), frame_width - 1)
+    x_bottom = min(max(x_bottom, 0), frame_width - 1)
+    return (x_bottom, y_bottom, x_top, y_top)
+
+
+def smooth_lane(previous, current, alpha=0.35):
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+    return tuple(
+        int((1.0 - alpha) * old + alpha * new)
+        for old, new in zip(previous, current)
+    )
+
+
+def detect_lane_boundaries(frame):
+    """Detect left/right lane boundaries while rejecting horizontal edges."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # A small blur suppresses sensor noise without erasing thin pen/tape lanes.
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 45, 135)
+
+    # Preserve common workshop markings (blue pen/tape and yellow tape). Road
+    # lane markings of other colors are still detected by their strong edges.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    blue = cv2.inRange(
+        hsv,
+        np.array([90, 35, 35], dtype=np.uint8),
+        np.array([140, 255, 255], dtype=np.uint8),
+    )
+    yellow = cv2.inRange(
+        hsv,
+        np.array([15, 60, 60], dtype=np.uint8),
+        np.array([40, 255, 255], dtype=np.uint8),
+    )
+    colored_markings = cv2.bitwise_or(blue, yellow)
+    colored_markings = cv2.morphologyEx(
+        colored_markings,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    candidates = cv2.bitwise_or(edges, colored_markings)
+
+    y_top = int(h * 0.35)
+    y_bottom = h - 1
+    roi = np.zeros_like(candidates)
+    polygon = np.array(
+        [[
+            (int(w * 0.02), y_bottom),
+            (int(w * 0.30), y_top),
+            (int(w * 0.70), y_top),
+            (int(w * 0.98), y_bottom),
+        ]],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(roi, polygon, 255)
+    candidates = cv2.bitwise_and(candidates, roi)
+
+    lines = cv2.HoughLinesP(
+        candidates,
+        1,
+        np.pi / 180,
+        threshold=22,
+        minLineLength=25,
+        maxLineGap=90,
+    )
+
+    left_segments = []
+    right_segments = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = map(int, line.flatten()[:4])
+            dx = x2 - x1
+            dy = y2 - y1
+            midpoint_x = (x1 + x2) / 2.0
+
+            # Paper/table edges are almost horizontal; real perspective lane
+            # boundaries have a meaningful vertical component.
+            if abs(dy) < 0.35 * max(abs(dx), 1):
+                continue
+
+            if abs(dx) <= 2:
+                if midpoint_x < w * 0.5:
+                    left_segments.append((x1, y1, x2, y2))
+                else:
+                    right_segments.append((x1, y1, x2, y2))
+                continue
+
+            slope = dy / dx
+            if slope < -0.35 and midpoint_x < w * 0.68:
+                left_segments.append((x1, y1, x2, y2))
+            elif slope > 0.35 and midpoint_x > w * 0.32:
+                right_segments.append((x1, y1, x2, y2))
+
+    return (
+        fit_lane_boundary(left_segments, y_top, y_bottom, w),
+        fit_lane_boundary(right_segments, y_top, y_bottom, w),
+    )
+
+
 def lane_fhd_thread(cam_index):
     set_thread_affinity("fhd")
     cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
@@ -267,45 +386,70 @@ def lane_fhd_thread(cam_index):
 
     frame_count = 0
     counter_start = time.perf_counter()
+    previous_left = None
+    previous_right = None
+    left_misses = 0
+    right_misses = 0
 
     while state["running"] and cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             continue
 
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (15, 15), 0)
-        edges = cv2.Canny(blur, 100, 200)
+        detected_left, detected_right = detect_lane_boundaries(frame)
+        if detected_left is None:
+            left_misses += 1
+            if left_misses > 5:
+                previous_left = None
+        else:
+            left_misses = 0
+            previous_left = smooth_lane(previous_left, detected_left)
 
-        mask = np.zeros_like(edges)
-        poly = np.array(
-            [[
-                (int(w * 0.1), h),
-                (int(w * 0.45), int(h * 0.6)),
-                (int(w * 0.55), int(h * 0.6)),
-                (int(w * 0.9), h),
-            ]],
-            np.int32,
-        )
-        cv2.fillPoly(mask, poly, 255)
-        masked_edges = cv2.bitwise_and(edges, mask)
+        if detected_right is None:
+            right_misses += 1
+            if right_misses > 5:
+                previous_right = None
+        else:
+            right_misses = 0
+            previous_right = smooth_lane(previous_right, detected_right)
 
-        lines = cv2.HoughLinesP(
-            masked_edges,
-            1,
-            np.pi / 180,
-            threshold=60,
-            minLineLength=50,
-            maxLineGap=40,
-        )
         overlay = np.zeros_like(frame)
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line.flatten()[:4]
-                cv2.line(overlay, (x1, y1), (x2, y2), (0, 255, 0), 4)
+        if previous_left is not None:
+            cv2.line(
+                overlay,
+                previous_left[:2],
+                previous_left[2:],
+                (0, 255, 0),
+                5,
+            )
+        if previous_right is not None:
+            cv2.line(
+                overlay,
+                previous_right[:2],
+                previous_right[2:],
+                (0, 255, 0),
+                5,
+            )
 
         blended = cv2.addWeighted(frame, 0.8, overlay, 1.0, 0)
+        if previous_left is not None and previous_right is not None:
+            lane_status = "LANE BOUNDARIES DETECTED"
+            status_color = (0, 255, 0)
+        elif previous_left is not None or previous_right is not None:
+            lane_status = "ONE LANE BOUNDARY DETECTED"
+            status_color = (0, 255, 255)
+        else:
+            lane_status = "SEARCHING FOR LANE BOUNDARIES"
+            status_color = (0, 165, 255)
+        cv2.putText(
+            blended,
+            lane_status,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            status_color,
+            2,
+        )
         frame_count += 1
         now = time.perf_counter()
         elapsed = now - counter_start
