@@ -17,7 +17,7 @@ import pyrealsense2 as rs
 from ultralytics import YOLO
 
 
-PIPELINE_VERSION = "2026.08.26-fps-v3"
+PIPELINE_VERSION = "2026.08.26-fps-v4"
 
 
 state = {
@@ -72,7 +72,10 @@ def linux_fhd_candidates():
 
     for device in video_root.glob("video*"):
         try:
-            index = int(device.name.removeprefix("video"))
+            # str.removeprefix() was added in Python 3.9. The UP Square
+            # workshop image uses Python 3.8, so parse the known prefix using
+            # slicing instead.
+            index = int(device.name[len("video"):])
             device_name = (device / "name").read_text().strip()
         except (OSError, ValueError):
             continue
