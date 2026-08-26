@@ -68,6 +68,9 @@ Verify the files (`best.xml`, `best.bin`, `metadata.yaml`) are present:
 ls models/best_openvino_model/
 ```
 
+For the optional FP32 vs FP16 vs calibrated INT8 export and comparison lab,
+follow [Session 5 OpenVINO Precision Optimization](session_05_model_hpc/optimization/README.md).
+
 ---
 
 ## 📷 Step 4: Camera Diagnostics & Discovery (Session 4)
