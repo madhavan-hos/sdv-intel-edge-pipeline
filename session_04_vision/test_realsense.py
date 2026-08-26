@@ -1,6 +1,7 @@
 import pyrealsense2 as rs
 import numpy as np
 import cv2
+import time
 
 def main():
     pipeline = rs.pipeline()
@@ -12,6 +13,9 @@ def main():
     pipeline.start(config)
 
     colorizer = rs.colorizer()
+    frame_count = 0
+    counter_start = time.perf_counter()
+    capture_fps = 0.0
 
     try:
         while True:
@@ -24,6 +28,24 @@ def main():
 
             color_image = np.asanyarray(color_frame.get_data())
             depth_image = np.asanyarray(colorizer.colorize(depth_frame).get_data())
+
+            frame_count += 1
+            now = time.perf_counter()
+            elapsed = now - counter_start
+            if elapsed >= 1.0:
+                capture_fps = frame_count / elapsed
+                frame_count = 0
+                counter_start = now
+
+            cv2.putText(
+                color_image,
+                f"RealSense SDK Capture: {capture_fps:.1f} FPS",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
 
             combined = np.hstack((color_image, depth_image))
             cv2.imshow("RealSense D435i (Color | Depth Colormap)", combined)

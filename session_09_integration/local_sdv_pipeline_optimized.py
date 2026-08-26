@@ -17,6 +17,9 @@ import pyrealsense2 as rs
 from ultralytics import YOLO
 
 
+PIPELINE_VERSION = "2026.08.26-fps-v3"
+
+
 state = {
     "running": True,
     "realsense_frame": None,
@@ -313,6 +316,7 @@ def main():
     fhd_index = args.fhd_index
     if fhd_index is None:
         fhd_index = auto_detect_fhd_camera()
+    print(f"[*] SDV optimized pipeline version: {PIPELINE_VERSION}")
     print(f"[*] Using FHD camera index: {fhd_index}")
     print(f"[*] Requesting RealSense RGB + depth at 640x480 @ {args.rs_fps} FPS")
 

@@ -13,7 +13,14 @@ print(f"OpenVINO Version: {ov.__version__}")
 
 try:
     import pyrealsense2 as rs
-    print(f"pyrealsense2:     {rs.__version__}")
+    try:
+        from importlib.metadata import version
+        rs_version = version("pyrealsense2")
+    except Exception:
+        # Some distro/librealsense builds intentionally do not expose
+        # pyrealsense2.__version__. Successful import is what matters here.
+        rs_version = getattr(rs, "__version__", "INSTALLED (version unavailable)")
+    print(f"pyrealsense2:     {rs_version}")
 except ImportError:
     print("pyrealsense2:     NOT INSTALLED (Required for RealSense D435i)")
 

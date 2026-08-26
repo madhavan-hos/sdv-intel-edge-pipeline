@@ -35,7 +35,9 @@ class LaneDetector:
         left_lines, right_lines = [], []
         if lines is not None:
             for line in lines:
-                x1, y1, x2, y2 = line[0]
+                # OpenCV 4 commonly returns (N, 1, 4), while OpenCV 5 builds
+                # may return (N, 4). Flattening supports both layouts.
+                x1, y1, x2, y2 = line.flatten()[:4]
                 if x2 == x1:
                     continue
                 slope = (y2 - y1) / (x2 - x1)
