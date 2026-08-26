@@ -17,7 +17,7 @@ import pyrealsense2 as rs
 from ultralytics import YOLO
 
 
-PIPELINE_VERSION = "2026.08.26-fps-v4"
+PIPELINE_VERSION = "2026.08.26-detection-v5"
 
 
 state = {
@@ -162,9 +162,28 @@ def realsense_capture_thread(target_fps):
         pipeline.stop()
 
 
-def realsense_inference_thread(model_path):
+def robust_depth_distance(depth_image, depth_scale, x1, y1, x2, y2):
+    """Return the median valid depth near a detection's center."""
+    height, width = depth_image.shape[:2]
+    cx = min(max((x1 + x2) // 2, 0), width - 1)
+    cy = min(max((y1 + y2) // 2, 0), height - 1)
+    radius = max(2, min(abs(x2 - x1), abs(y2 - y1)) // 10)
+    sample = depth_image[
+        max(0, cy - radius):min(height, cy + radius + 1),
+        max(0, cx - radius):min(width, cx + radius + 1),
+    ]
+    valid = sample[sample > 0]
+    if valid.size == 0:
+        return 0.0
+    return float(np.median(valid)) * depth_scale
+
+
+def realsense_inference_thread(model_path, confidence, iou):
     set_thread_affinity("inference")
     model = YOLO(model_path, task="detect")
+    print("[*] Inference location: LOCAL UP Square OpenVINO CPU")
+    print(f"[*] Model classes: {model.names}")
+    print(f"[*] Detection thresholds: confidence={confidence:.2f}, IoU={iou:.2f}")
     last_sequence = -1
     frame_count = 0
     counter_start = time.perf_counter()
@@ -185,19 +204,47 @@ def realsense_inference_thread(model_path):
             last_sequence = sequence
 
         inference_start = time.perf_counter()
-        results = model.predict(source=color_image, imgsz=640, verbose=False)
+        results = model.predict(
+            source=color_image,
+            imgsz=640,
+            conf=confidence,
+            iou=iou,
+            verbose=False,
+        )
         inference_ms = (time.perf_counter() - inference_start) * 1000.0
 
-        height, width = depth_image.shape[:2]
         detections = []
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cx = min(max((x1 + x2) // 2, 0), width - 1)
-            cy = min(max((y1 + y2) // 2, 0), height - 1)
-            distance = float(depth_image[cy, cx]) * depth_scale
+            distance = robust_depth_distance(
+                depth_image, depth_scale, x1, y1, x2, y2
+            )
             class_name = model.names[int(box.cls[0])]
-            color = (0, 0, 255) if 0.0 < distance < 1.2 else (0, 255, 0)
-            detections.append((x1, y1, x2, y2, class_name, distance, color))
+            confidence_score = float(box.conf[0])
+
+            if 0.0 < distance < 1.2:
+                color = (0, 0, 255)
+                status = "COLLISION WARNING"
+            elif 1.2 <= distance < 2.5:
+                color = (0, 255, 255)
+                status = "CAUTION"
+            else:
+                color = (0, 255, 0)
+                status = "CLEAR"
+
+            detections.append(
+                (
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    class_name,
+                    confidence_score,
+                    distance,
+                    status,
+                    color,
+                )
+            )
 
         frame_count += 1
         now = time.perf_counter()
@@ -274,11 +321,21 @@ def lane_fhd_thread(cam_index):
 
 
 def draw_detections(frame, detections):
-    for x1, y1, x2, y2, class_name, distance, color in detections:
+    for (
+        x1,
+        y1,
+        x2,
+        y2,
+        class_name,
+        confidence,
+        distance,
+        status,
+        color,
+    ) in detections:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
             frame,
-            f"{class_name} {distance:.2f}m",
+            f"{class_name} {confidence:.2f} | {distance:.2f}m [{status}]",
             (x1, max(y1 - 8, 18)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -308,11 +365,27 @@ def parse_args():
         default=15,
         help="Requested RealSense color/depth FPS (default: 15)",
     )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.25,
+        help="Minimum object confidence from 0.0 to 1.0 (default: 0.25)",
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.45,
+        help="Non-maximum-suppression IoU threshold (default: 0.45)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if not 0.0 <= args.confidence <= 1.0:
+        raise SystemExit("--confidence must be between 0.0 and 1.0")
+    if not 0.0 <= args.iou <= 1.0:
+        raise SystemExit("--iou must be between 0.0 and 1.0")
     # OpenCV otherwise creates its own worker pool in addition to OpenVINO's
     # pool, which can starve USB camera acquisition on a four-core Atom CPU.
     cv2.setNumThreads(1)
@@ -331,7 +404,7 @@ def main():
         ),
         threading.Thread(
             target=realsense_inference_thread,
-            args=(args.model_path,),
+            args=(args.model_path, args.confidence, args.iou),
             daemon=True,
         ),
         threading.Thread(target=lane_fhd_thread, args=(fhd_index,), daemon=True),

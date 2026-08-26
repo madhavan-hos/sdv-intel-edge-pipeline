@@ -123,6 +123,50 @@ source ai_env/bin/activate
 python session_09_integration/local_sdv_pipeline.py models/best_openvino_model/
 ```
 
+For the responsive pipeline that keeps camera capture independent from AI
+inference, run:
+
+```bash
+python session_09_integration/local_sdv_pipeline_optimized.py \
+  models/best_openvino_model/ \
+  --fhd-index 0 \
+  --rs-fps 15 \
+  --confidence 0.25
+```
+
+This command performs inference **locally on the UP Square CPU**. The HPC server
+is used to train/export the model and the resulting OpenVINO files are copied to
+the edge device. Remote HPC inference happens only when the separate
+`hpc_server_inference.py` and `edge_client_streamer.py` programs are used.
+
+### Choosing the Detection Model
+
+`models/best_openvino_model/` is fine-tuned on the road-scene IDD dataset. It is
+the preferred workshop model for road users, but an indoor close-up person can
+be outside its training distribution and may be misclassified. For a generic
+indoor demonstration, export the pretrained generic Ultralytics model on
+the HPC server without IDD fine-tuning:
+
+```bash
+python session_05_model_hpc/export_openvino.py --weights yolo26n.pt
+```
+
+Copy the generated `yolo26n_openvino_model/` directory to the edge device and
+select it when starting the dashboard:
+
+```bash
+python session_09_integration/local_sdv_pipeline_optimized.py \
+  models/yolo26n_openvino_model/ \
+  --fhd-index 0 \
+  --rs-fps 15 \
+  --confidence 0.20
+```
+
+Use the generic pretrained model for indoor person/object demonstrations and
+the IDD-fine-tuned model for road-scene demonstrations. For production, retrain
+or fine-tune one model on representative images from the intended camera,
+mounting position, lighting, and environment.
+
 ### Dashboard Distance Logic:
 * **Green (Clear):** Distance > 2.5 meters.
 * **Yellow (Caution):** Distance between 1.2m and 2.5m.
