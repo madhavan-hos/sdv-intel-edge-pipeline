@@ -6,6 +6,8 @@ always processes the newest RealSense frame instead of building a stale queue.
 """
 
 import argparse
+import os
+from pathlib import Path
 import threading
 import time
 
@@ -31,22 +33,82 @@ state_lock = threading.Lock()
 new_realsense_frame = threading.Condition(state_lock)
 
 
+def set_thread_affinity(role):
+    """Reserve CPU time for camera capture on Linux edge hardware."""
+    if not hasattr(os, "sched_setaffinity"):
+        return
+
+    available = sorted(os.sched_getaffinity(0))
+    if len(available) < 4:
+        return
+
+    if role == "realsense":
+        selected = {available[0]}
+    elif role == "fhd":
+        selected = {available[1]}
+    elif role == "inference":
+        selected = set(available[2:])
+    else:
+        return
+
+    try:
+        # pid=0 means the calling Linux thread. OpenVINO workers created after
+        # this call inherit the inference thread's restricted CPU set.
+        os.sched_setaffinity(0, selected)
+        print(f"[*] {role} CPU affinity: {sorted(selected)}")
+    except OSError as exc:
+        print(f"[!] Unable to set {role} CPU affinity: {exc}")
+
+
+def linux_fhd_candidates():
+    """Return V4L indices while explicitly excluding RealSense video nodes."""
+    candidates = []
+    video_root = Path("/sys/class/video4linux")
+    if not video_root.exists():
+        return candidates
+
+    for device in video_root.glob("video*"):
+        try:
+            index = int(device.name.removeprefix("video"))
+            device_name = (device / "name").read_text().strip()
+        except (OSError, ValueError):
+            continue
+
+        if "realsense" in device_name.lower():
+            continue
+
+        # Prefer the workshop FHD camera, then generic USB cameras.
+        lowered = device_name.lower()
+        priority = 0 if "fhd" in lowered else 1 if "usb" in lowered else 2
+        candidates.append((priority, index, device_name))
+
+    return sorted(candidates)
+
+
 def auto_detect_fhd_camera():
-    for i in range(12):
+    candidates = linux_fhd_candidates()
+    indices = [index for _, index, _ in candidates]
+    if not indices:
+        indices = list(range(12))
+
+    for i in indices:
         cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
         if cap.isOpened():
             ret, _ = cap.read()
             cap.release()
             if ret:
+                matched = next((name for _, idx, name in candidates if idx == i), "unknown")
+                print(f"[*] Auto-detected FHD candidate /dev/video{i}: {matched}")
                 return i
     return 0
 
 
-def realsense_capture_thread():
+def realsense_capture_thread(target_fps):
+    set_thread_affinity("realsense")
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, target_fps)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, target_fps)
     align = rs.align(rs.stream.color)
     profile = pipeline.start(config)
     depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
@@ -95,6 +157,7 @@ def realsense_capture_thread():
 
 
 def realsense_inference_thread(model_path):
+    set_thread_affinity("inference")
     model = YOLO(model_path, task="detect")
     last_sequence = -1
     frame_count = 0
@@ -143,6 +206,7 @@ def realsense_inference_thread(model_path):
 
 
 def lane_fhd_thread(cam_index):
+    set_thread_affinity("fhd")
     cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -231,18 +295,33 @@ def parse_args():
         default=None,
         help="Use a known FHD camera index instead of automatic detection",
     )
+    parser.add_argument(
+        "--rs-fps",
+        type=int,
+        choices=(15, 30),
+        default=15,
+        help="Requested RealSense color/depth FPS (default: 15)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    # OpenCV otherwise creates its own worker pool in addition to OpenVINO's
+    # pool, which can starve USB camera acquisition on a four-core Atom CPU.
+    cv2.setNumThreads(1)
     fhd_index = args.fhd_index
     if fhd_index is None:
         fhd_index = auto_detect_fhd_camera()
     print(f"[*] Using FHD camera index: {fhd_index}")
+    print(f"[*] Requesting RealSense RGB + depth at 640x480 @ {args.rs_fps} FPS")
 
     threads = [
-        threading.Thread(target=realsense_capture_thread, daemon=True),
+        threading.Thread(
+            target=realsense_capture_thread,
+            args=(args.rs_fps,),
+            daemon=True,
+        ),
         threading.Thread(
             target=realsense_inference_thread,
             args=(args.model_path,),
@@ -256,6 +335,7 @@ def main():
     display_frames = 0
     display_start = time.perf_counter()
     display_fps = 0.0
+    last_displayed_sequence = -1
 
     try:
         while state["running"]:
@@ -273,13 +353,16 @@ def main():
                 inference_fps = state["fps_rs_inference"]
                 inference_ms = state["inference_ms"]
                 fhd_fps = state["fps_fhd"]
+                realsense_sequence = state["realsense_sequence"]
 
             if real_frame is not None and lane_frame is not None:
                 draw_detections(real_frame, detections)
                 real_frame = cv2.resize(real_frame, (640, 480))
                 lane_frame = cv2.resize(lane_frame, (640, 480))
 
-                display_frames += 1
+                if realsense_sequence != last_displayed_sequence:
+                    display_frames += 1
+                    last_displayed_sequence = realsense_sequence
                 now = time.perf_counter()
                 elapsed = now - display_start
                 if elapsed >= 1.0:
@@ -298,7 +381,7 @@ def main():
                 )
                 cv2.putText(
                     real_frame,
-                    f"AI latency: {inference_ms:.0f} ms | Display: {display_fps:.1f} FPS",
+                    f"AI latency: {inference_ms:.0f} ms | RS display: {display_fps:.1f} FPS",
                     (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.52,
